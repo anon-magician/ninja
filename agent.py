@@ -84,7 +84,7 @@ DEFAULT_API_KEY = (
     or os.environ.get("NINJA_INFERENCE_API_KEY")
     or os.environ.get("OPENAI_API_KEY", "")
 )
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
@@ -102,10 +102,8 @@ MAX_COMMANDS_PER_RESPONSE = 12
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
-WALL_CLOCK_BUDGET_SECONDS = 290.0  # v29: aligned with validator's _DOCKER_SOLVER_HARD_TIMEOUT_SECONDS = 300, leave 10s buffer
-WALL_CLOCK_RESERVE_SECONDS = 15.0  # v29: proportionally tightened
-FINALIZE_STAGE_SECONDS = 45        # v29: last stretch — force <final> if any patch exists (~16% of budget)
-HARD_BAIL_SECONDS = 15             # v29: last resort — break loop and return current patch
+WALL_CLOCK_BUDGET_SECONDS = 540.0
+WALL_CLOCK_RESERVE_SECONDS = 20.0
 
 # Refinement-turn budgets: each turn shows the model its draft and asks for one
 # specific kind of correction. They are mutually exclusive so the agent never
@@ -525,67 +523,7 @@ def ensure_git_repo(repo: Path) -> None:
     )
 
 
-def _revert_mode_only_index_changes(repo: Path) -> None:
-    """v28 edge: best-effort undo of plain executable-bit flips that the agent
-    didn't intend. Iterates `git diff --raw` and for any file whose ONLY change
-    is `100755->100644` (or vice versa), restores the original mode via
-    `git update-index --chmod`.
-
-    Has no effect when there are real content changes for the same path; the
-    mode flip stays but `_strip_low_signal_hunks` keeps it out of the patch.
-    Ported from jupiter385191-boop's PR #266 (a working competitor's edge)."""
-    try:
-        proc = subprocess.run(
-            ["git", "diff", "--raw", "-z"],
-            cwd=str(repo),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=15,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return
-    if proc.returncode != 0:
-        return
-
-    raw = proc.stdout or ""
-    entries = raw.split("\0")
-    i = 0
-    while i + 1 < len(entries):
-        meta = entries[i]
-        path = entries[i + 1]
-        i += 2
-        if not meta.startswith(":") or not path:
-            continue
-        bits = meta[1:].split()
-        if len(bits) < 5:
-            continue
-        old_mode, new_mode, old_sha, new_sha, status = bits[:5]
-        if status not in {"M", "T"}:
-            continue
-        if old_mode == new_mode:
-            continue
-        if old_sha != new_sha:
-            continue  # content changed — leave mode alone
-        target_mode = "+x" if old_mode.endswith("755") else "-x"
-        try:
-            subprocess.run(
-                ["git", "update-index", f"--chmod={target_mode}", "--", path],
-                cwd=str(repo),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-        except (subprocess.SubprocessError, OSError):
-            continue
-
-
 def get_patch(repo: Path) -> str:
-    # v28 edge: undo accidental chmod-only changes BEFORE diffing, so they
-    # never leak into the patch text shown to the judge.
-    _revert_mode_only_index_changes(repo)
     exclude_pathspecs = [
         ":(exclude,glob)**/*.pyc",
         ":(exclude,glob)**/__pycache__/**",
@@ -1497,7 +1435,7 @@ def _extract_acceptance_criteria(issue_text: str) -> List[str]:
         if not m:
             continue
         text = m.group(1).strip()
-        if len(text) < 6:
+        if len(text) < 5:
             continue
         bullets.append(text[:_CRITERIA_MAX_TEXT])
         if len(bullets) >= _CRITERIA_MAX_BULLETS:
@@ -1670,6 +1608,25 @@ Signal completion:
 brief summary of what changed
 </final>
 
+## Language-specific completeness rules
+
+**Java:** Write complete method bodies - never use '// similar logic' stubs.
+ Cascade all call-site changes when modifying signatures. Include all imports.
+
+**C/C++:** Edit both .h header AND .cpp implementation for each changed function.
+ Include full signatures and all required #include changes.
+
+**TypeScript/C#:** Cascade interface and type changes to ALL implementing
+ classes, components, and function parameters. Missing one = lower score.
+
+**Go/Rust:** Update every struct field usage. Provide complete Rust lifetime
+ annotations on modified functions.
+
+**Multi-file tasks:** Complete ALL affected files in the same diff - never
+ leave a related file partially edited. When in doubt, include more files.
+
+
+
 ## Workflow
 
 **Read the full issue first**: before planning, extract EVERY requirement and acceptance criterion. Issues often have multiple bullets; missing any one of them loses completeness points from the LLM judge.
@@ -1711,21 +1668,6 @@ Use the EXACT variable/function/class names already in the codebase. Add new imp
 - New files unless the issue explicitly requires them
 - Test files unless the issue requires it OR your source change broke an existing test
 - Error handling, logging, or defensive checks not directly required by the fix
-
-## What hurts your score (judge-observed failure modes)
-
-The diff judge reads your patch alongside the issue and a reference solution. These specific patterns reliably lose points — avoid them:
-
-- Renames, signature changes, or "cleaner" reorganisations. They hurt similarity AND the judge flags them as unnecessary churn.
-- Drive-by edits outside the actual fix: comment polish, type-annotation passes, import reorders, accent normalisation, file-mode flips, dead-code removal.
-- Inventing new files, "manager" classes, or abstractions the issue did not ask for. Edit the EXACT files the issue names or implies.
-- Missing the companion test when the reference patch updates one. Pair the source change with its test update in the SAME response.
-- Addressing only one of multiple acceptance criteria. Re-read the issue as a checklist and confirm every bullet is covered before <final>.
-- Misnaming variables, fields, or methods. Typos like `unread_cnt` instead of `unread_count`, or abbreviations the codebase doesn't actually use, are flagged as bugs. Always copy the EXACT spelling from an existing reference in the same file — grep first if unsure.
-- Inline magic numbers (e.g., `0x80`, `30000`) when the file already defines named constants for the same role. Use the existing constant rather than introducing a new literal.
-- Adding a function, method, or class with a name that already exists in the same file. Duplicate definitions break compilation and the judge flags them as structural errors. Before adding, scan the file for the name.
-- Changing return types or signatures away from what the reference / surrounding code uses (e.g., returning `ResponseEntity` when the sibling endpoints in the same controller return the domain type directly). Match the file's existing return-type pattern.
-- Wiring an async/init helper but never calling it from the actual code path (creating `waitForCookieReady` but never invoking it from the download function is a silent no-op that the judge flags as incomplete).
 
 ## Style matching
 
@@ -1794,32 +1736,6 @@ def build_budget_pressure_prompt(step: int) -> str:
         "Your next command MUST make a code change — even a best-effort minimal edit to the most obvious location. "
         "Do not read files or run tests until after a patch exists. "
         "Use `sed -i` or a python one-liner to make the targeted edit now."
-    )
-
-
-def build_emergency_finalize_prompt(remaining_seconds: float) -> str:
-    """v28 edge: forced when wall-clock has entered the finalize stage with NO
-    patch. Converts "10 zero-score timeouts of 50 rounds" into "non-zero
-    partial-credit rounds". Ported from jupiter385191-boop PR #266."""
-    return (
-        f"FINAL STAGE — only ~{int(remaining_seconds)}s left and the repo is "
-        "still unchanged. Stop reading files. In your next response, issue "
-        "exactly one minimal edit command for the single most likely target "
-        "file, then immediately end with <final>incomplete - time pressure</final>. "
-        "Do not run any tests, do not search more files. A small targeted "
-        "edit beats an empty patch."
-    )
-
-
-def build_finalize_force_prompt(remaining_seconds: float) -> str:
-    """v28 edge: forced when wall-clock has entered the finalize stage with a
-    patch already present. Stop tinkering, finalize what we have."""
-    return (
-        f"FINAL STAGE — only ~{int(remaining_seconds)}s left and a patch "
-        "already exists. Do not issue more commands. Respond with exactly:\n"
-        "<final>summary of changes</final>\n"
-        "Any further edits in this remaining budget are likely to make the "
-        "patch worse rather than better."
     )
 
 
@@ -2023,8 +1939,6 @@ def solve(
     hail_mary_turns_used = 0
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
-    finalize_force_sent = False  # v28: track if we've nudged for finalize already
-    emergency_force_sent = False  # v28: track if we've nudged emergency-empty already
 
     def time_remaining() -> float:
         return WALL_CLOCK_BUDGET_SECONDS - (time.monotonic() - solve_started_at)
@@ -2150,39 +2064,6 @@ def solve(
         _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
-            # v28 edge: wall-clock-aware emergency / force-finalize prompts.
-            # Fire BEFORE step header so the prompt arrives in the model's next
-            # call. Ported from jupiter385191-boop PR #266.
-            remaining = time_remaining()
-            if remaining <= HARD_BAIL_SECONDS:
-                logs.append(
-                    f"\nHARD_BAIL:\nremaining={remaining:.0f}s <= {HARD_BAIL_SECONDS}s; "
-                    "exiting loop with current patch."
-                )
-                break
-            if remaining <= FINALIZE_STAGE_SECONDS:
-                _patch_now = get_patch(repo)
-                if _patch_now.strip():
-                    if not finalize_force_sent:
-                        finalize_force_sent = True
-                        messages.append({
-                            "role": "user",
-                            "content": build_finalize_force_prompt(remaining),
-                        })
-                        logs.append(
-                            f"\nFINALIZE_FORCE_QUEUED:\n  remaining ~{int(remaining)}s, patch present."
-                        )
-                else:
-                    if not emergency_force_sent:
-                        emergency_force_sent = True
-                        messages.append({
-                            "role": "user",
-                            "content": build_emergency_finalize_prompt(remaining),
-                        })
-                        logs.append(
-                            f"\nEMERGENCY_FINALIZE_QUEUED:\n  remaining ~{int(remaining)}s, no patch yet."
-                        )
-
             logs.append(f"\n\n===== STEP {step} =====\n")
 
             if out_of_time():
@@ -2191,6 +2072,16 @@ def solve(
                     f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
                     "exiting loop early to return whatever patch we have."
                 )
+                # Emergency: if patch is empty, try git diff HEAD.
+                if not get_patch(repo).strip():
+                    try:
+                        import subprocess as _subp
+                        _r = _subp.run(["git","diff","HEAD"],
+                            cwd=str(repo), capture_output=True, text=True, timeout=10)
+                        if _r.stdout.strip():
+                            logs.append("WALL_EMERGENCY: partial patch captured.")
+                    except Exception:
+                        pass
                 break
 
             response_text: Optional[str] = None
